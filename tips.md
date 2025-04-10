@@ -1,937 +1,328 @@
-# 4. ALS推荐模型实现
+我理解您希望了解这些函数应该如何添加到您的代码中。基于您的`rec.ipynb`文件和当前上下文，我将详细说明如何实现这些函数，以及它们应该放在哪个位置。
 
-根据您的数据特点和需求，我们将实现基于交替最小二乘法(ALS)的推荐系统模型。ALS特别适合处理稀疏的隐式反馈数据，如用户-餐厅签到记录。
+## 首先，添加`get_similar_users_recommendations`函数
 
-## 4.1 ALS模型原理
-
-```python
-# ALS模型原理解析
-"""
-ALS（交替最小二乘法）原理：
-
-1. 基本思想：将用户-物品交互矩阵分解为两个低维矩阵的乘积：R ≈ P × Q^T
-   - R: 用户-物品评分/交互矩阵
-   - P: 用户特征矩阵
-   - Q: 物品特征矩阵
-
-2. 对于隐式反馈，ALS使用加权损失函数：
-   L = Σ c_ui (p_ui - x_ui)² + λ(||P||² + ||Q||²)
-   其中：
-   - c_ui: 置信度权重，通常设为 1 + α·r_ui
-   - p_ui: 预测评分/喜好
-   - x_ui: 观察到的隐式反馈值
-   - λ: 正则化参数，防止过拟合
-
-3. 优化方法：交替优化P和Q
-   - 固定Q，优化P
-   - 固定P，优化Q
-   - 重复直到收敛
-
-4. 优点：
-   - 可并行计算
-   - 适合稀疏数据
-   - 处理隐式反馈效果好
-
-5. 超参数：
-   - rank: 隐因子维度
-   - alpha: 置信度系数
-   - regParam: 正则化参数
-"""
-```
-
-## 4.2 环境准备与数据加载
+这个函数应该添加在"4.3 基于用户特征的推荐"部分，在`recommend_by_similar_users`函数之后：
 
 ```python
-# 导入必要的库
-import pandas as pd
-import numpy as np
-from pyspark.sql import SparkSession
-from pyspark.ml.recommendation import ALS
-from pyspark.ml.evaluation import RegressionEvaluator
-from pyspark.sql.functions import col
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-# 设置中文显示
-import matplotlib as mpl
-mpl.rcParams['font.sans-serif'] = ['SimHei']  
-mpl.rcParams['axes.unicode_minus'] = False
-
-# 创建Spark会话
-spark = SparkSession.builder \
-    .appName("Restaurant Recommendation") \
-    .getOrCreate()
-
-# 加载数据
-user_features_pd = pd.read_csv('data/user_features.csv')
-interaction_features_pd = pd.read_csv('data/interaction_features.csv')
-
-# 转换为Spark DataFrame
-user_features = spark.createDataFrame(user_features_pd)
-interaction_features = spark.createDataFrame(interaction_features_pd)
-
-# 查看数据概要
-print("交互数据概览:")
-interaction_features.printSchema()
-interaction_features.show(5)
-
-print("用户数量:", interaction_features.select("user_id").distinct().count())
-print("餐厅数量:", interaction_features.select("venue_id").distinct().count())
-print("交互总数:", interaction_features.count())
-```
-
-## 4.3 数据预处理与转换
-
-```python
-# 为ALS模型准备数据
-def prepare_als_data(interaction_df):
-    """准备用于ALS模型的数据"""
-    # 1. 确保评分/交互值存在
-    if 'checkin_count' not in interaction_df.columns:
-        raise ValueError("数据中需要有checkin_count列")
-    
-    # 2. 重命名列以符合ALS需求
-    als_data = interaction_df.select(
-        col('user_id').alias('user'),
-        col('venue_id').alias('item'),
-        col('checkin_count').alias('rating')
-    )
-    
-    # 3. 处理缺失值，ALS不支持缺失值
-    als_data = als_data.na.fill(1)  # 将缺失的交互次数设为1
-    
-    return als_data
-
-# 准备训练数据
-als_data = prepare_als_data(interaction_features)
-print("ALS模型数据概览:")
-als_data.show(5)
-
-# 分割训练集和测试集
-train_data, test_data = als_data.randomSplit([0.8, 0.2], seed=42)
-print(f"训练集大小: {train_data.count()}")
-print(f"测试集大小: {test_data.count()}")
-
-# 可视化交互次数分布
-plt.figure(figsize=(10, 6))
-interaction_counts = interaction_features_pd['checkin_count'].value_counts().sort_index()
-sns.barplot(x=interaction_counts.index, y=interaction_counts.values)
-plt.title('用户-餐厅交互次数分布', fontsize=14)
-plt.xlabel('交互次数', fontsize=12)
-plt.ylabel('频次', fontsize=12)
-plt.xticks(rotation=45)
-plt.tight_layout()
-plt.show()
-```
-
-## 4.4 构建ALS基础模型
-
-```python
-# 构建ALS模型
-def build_als_model(train_data, implicit=True, rank=10, reg_param=0.1, alpha=1.0, max_iter=10):
+def get_similar_users_recommendations(user_id, user_features_df, interaction_df, N=10):
     """
-    构建并训练ALS推荐模型
+    基于用户相似度的协作过滤推荐
     
     参数:
-        train_data: 训练数据
-        implicit: 是否为隐式反馈数据
-        rank: 隐因子维度
-        reg_param: 正则化参数
-        alpha: 置信度系数（仅用于隐式反馈）
-        max_iter: 最大迭代次数
-    
-    返回:
-        训练好的ALS模型
+    - user_id: 目标用户ID
+    - user_features_df: 用户特征DataFrame
+    - interaction_df: 交互数据DataFrame
+    - N: 推荐数量
     """
-    # 初始化ALS模型
-    als = ALS(
-        userCol="user",
-        itemCol="item",
-        ratingCol="rating",
-        rank=rank,
-        regParam=reg_param,
-        implicitPrefs=implicit,
-        alpha=alpha,
-        maxIter=max_iter,
-        coldStartStrategy="drop"  # 处理冷启动问题
-    )
-    
-    # 训练模型
-    model = als.fit(train_data)
-    
-    return model
-
-# 训练基础ALS模型
-base_model = build_als_model(
-    train_data,
-    implicit=True,
-    rank=10,
-    reg_param=0.1,
-    alpha=1.0,
-    max_iter=10
-)
-
-print("基础ALS模型训练完成")
-```
-
-## 4.5 模型评估
-
-```python
-# 模型评估函数
-def evaluate_als_model(model, test_data):
-    """
-    评估ALS模型性能
-    
-    参数:
-        model: 训练好的ALS模型
-        test_data: 测试数据
-    
-    返回:
-        评估指标结果
-    """
-    # 对测试集进行预测
-    predictions = model.transform(test_data)
-    
-    # 使用RMSE(均方根误差)评估
-    evaluator = RegressionEvaluator(
-        metricName="rmse",
-        labelCol="rating",
-        predictionCol="prediction"
-    )
-    rmse = evaluator.evaluate(predictions)
-    
-    # 计算MAE(平均绝对误差)
-    evaluator = RegressionEvaluator(
-        metricName="mae",
-        labelCol="rating",
-        predictionCol="prediction"
-    )
-    mae = evaluator.evaluate(predictions)
-    
-    return {
-        "RMSE": rmse,
-        "MAE": mae
-    }
-
-# 评估基础模型
-base_metrics = evaluate_als_model(base_model, test_data)
-print("基础模型评估指标:")
-for metric_name, value in base_metrics.items():
-    print(f"{metric_name}: {value:.4f}")
-```
-
-## 4.6 生成推荐结果
-
-```python
-# 为所有用户生成推荐
-def generate_recommendations(model, n_recommendations=10):
-    """为所有用户生成推荐结果"""
-    user_recs = model.recommendForAllUsers(n_recommendations)
-    return user_recs
-
-# 为特定用户生成推荐
-def recommend_for_user(model, user_id, n_recommendations=10):
-    """为特定用户生成推荐"""
-    user_recs = model.recommendForUserSubset(
-        spark.createDataFrame([(user_id,)], ["user"]),
-        n_recommendations
-    )
-    return user_recs
-
-# 生成推荐结果
-all_recommendations = generate_recommendations(base_model, 10)
-print("推荐结果示例:")
-all_recommendations.show(5, truncate=False)
-
-# 为示例用户生成推荐
-sample_user_id = interaction_features_pd['user_id'].iloc[0]
-user_recommendations = recommend_for_user(base_model, sample_user_id, 10)
-print(f"用户 {sample_user_id} 的推荐结果:")
-user_recommendations.show(truncate=False)
-```
-
-## 4.7 模型解释与可视化
-
-```python
-# 提取并可视化用户和物品特征矩阵
-def visualize_embeddings(model, n_users=10, n_items=10):
-    """可视化用户和物品的嵌入向量"""
-    # 提取用户特征
-    user_factors = model.userFactors.toPandas()
-    user_factors = user_factors.sort_values('id').head(n_users)
-    
-    # 提取物品特征
-    item_factors = model.itemFactors.toPandas()
-    item_factors = item_factors.sort_values('id').head(n_items)
-    
-    # 将特征向量转换为二维空间进行可视化
-    from sklearn.decomposition import PCA
-    
-    # 应用PCA
-    pca = PCA(n_components=2)
-    user_pca = pca.fit_transform(np.vstack(user_factors['features']))
-    item_pca = pca.fit_transform(np.vstack(item_factors['features']))
-    
-    # 可视化
-    plt.figure(figsize=(12, 6))
-    
-    # 用户嵌入向量
-    plt.subplot(1, 2, 1)
-    plt.scatter(user_pca[:, 0], user_pca[:, 1], c='blue', alpha=0.7)
-    plt.title("用户嵌入向量的2D可视化", fontsize=14)
-    plt.xlabel("主成分1")
-    plt.ylabel("主成分2")
-    
-    # 物品嵌入向量
-    plt.subplot(1, 2, 2)
-    plt.scatter(item_pca[:, 0], item_pca[:, 1], c='red', alpha=0.7)
-    plt.title("餐厅嵌入向量的2D可视化", fontsize=14)
-    plt.xlabel("主成分1")
-    plt.ylabel("主成分2")
-    
-    plt.tight_layout()
-    plt.show()
-
-# 可视化嵌入向量
-visualize_embeddings(base_model)
-
-# 分析用户-物品相似度
-def analyze_user_item_similarity(model, user_id, top_n=5):
-    """分析用户与推荐项目的相似度"""
-    # 获取用户的嵌入向量
-    user_vector = model.userFactors.filter(col('id') == user_id).select('features').collect()[0][0]
-    
-    # 获取所有物品的嵌入向量
-    item_factors = model.itemFactors.toPandas()
-    
-    # 计算用户与所有物品的余弦相似度
-    similarities = []
-    for _, row in item_factors.iterrows():
-        item_id = row['id']
-        item_vector = row['features']
-        
-        # 计算余弦相似度
-        similarity = np.dot(user_vector, item_vector) / (np.linalg.norm(user_vector) * np.linalg.norm(item_vector))
-        similarities.append((item_id, similarity))
-    
-    # 排序并获取最相似的物品
-    similarities.sort(key=lambda x: x[1], reverse=True)
-    top_items = similarities[:top_n]
-    
-    return top_items
-
-# 分析示例用户与推荐项目的相似度
-sample_user_id = interaction_features_pd['user_id'].iloc[0]
-top_similar_items = analyze_user_item_similarity(base_model, sample_user_id)
-print(f"与用户 {sample_user_id} 最相似的餐厅:")
-for item_id, similarity in top_similar_items:
-    print(f"餐厅ID: {item_id}, 相似度: {similarity:.4f}")
-```
-
-## 4.8 保存模型
-
-```python
-# 保存模型以备后用
-def save_als_model(model, path):
-    """保存ALS模型"""
-    model.save(path)
-    print(f"模型已保存到 {path}")
-
-# 加载保存的模型
-def load_als_model(path):
-    """加载保存的ALS模型"""
-    from pyspark.ml.recommendation import ALSModel
-    model = ALSModel.load(path)
-    print(f"模型已从 {path} 加载")
-    return model
-
-# 创建模型保存目录
-import os
-os.makedirs('models', exist_ok=True)
-
-# 保存基础模型
-save_als_model(base_model, "models/base_als_model")
-```
-
-# 5. ALS模型超参数调优
-
-为了获得最佳性能，我们需要对ALS模型的关键超参数进行系统的调优。这部分将实施不同的超参数调优策略，找到最优模型配置。
-
-## 5.1 超参数调优的理论基础
-
-```python
-# 超参数调优理论基础
-"""
-ALS模型的主要超参数及其影响:
-
-1. rank (隐因子维度):
-   - 控制潜在因子空间的维度
-   - 过小: 无法捕捉足够的数据模式
-   - 过大: 容易过拟合，增加计算复杂度
-   - 典型范围: 10-200
-
-2. regParam (正则化参数):
-   - 控制模型复杂度，防止过拟合
-   - 过小: 可能导致过拟合
-   - 过大: 可能无法捕捉足够的模式
-   - 典型范围: 0.01-1.0
-
-3. alpha (置信度系数):
-   - 用于隐式反馈模型
-   - 控制观察到的交互的置信度
-   - 较大的值增加正样本的权重
-   - 典型范围: 1.0-40.0
-
-4. maxIter (最大迭代次数):
-   - 控制算法的收敛过程
-   - 需要足够大以确保收敛
-   - 典型范围: 5-20次迭代
-
-5. numBlocks (分区数):
-   - 影响并行计算效率
-   - 调整数据分区方式
-   - 通常设置为集群核心数的倍数
-"""
-```
-
-## 5.2 网格搜索超参数调优
-
-```python
-# 使用网格搜索进行超参数调优
-from pyspark.ml.tuning import ParamGridBuilder, CrossValidator
-import time
-
-# 定义用于网格搜索的超参数网格
-def create_param_grid(als):
-    """创建超参数网格"""
-    param_grid = ParamGridBuilder() \
-        .addGrid(als.rank, [10, 20, 50]) \
-        .addGrid(als.regParam, [0.01, 0.1, 0.5]) \
-        .addGrid(als.alpha, [1.0, 10.0, 40.0]) \
-        .build()
-    
-    return param_grid
-
-# 使用交叉验证进行网格搜索
-def grid_search_cv(train_data, test_data):
-    """使用交叉验证进行网格搜索超参数调优"""
-    # 初始化ALS模型
-    als = ALS(
-        userCol="user",
-        itemCol="item",
-        ratingCol="rating",
-        implicitPrefs=True,
-        coldStartStrategy="drop",
-        maxIter=10  # 固定最大迭代次数以加速调优
-    )
-    
-    # 创建超参数网格
-    param_grid = create_param_grid(als)
-    
-    # 创建评估器
-    evaluator = RegressionEvaluator(
-        metricName="rmse",
-        labelCol="rating",
-        predictionCol="prediction"
-    )
-    
-    # 设置交叉验证
-    cv = CrossValidator(
-        estimator=als,
-        estimatorParamMaps=param_grid,
-        evaluator=evaluator,
-        numFolds=3,  # 3折交叉验证
-        parallelism=4  # 并行度
-    )
-    
-    print("开始网格搜索超参数调优...")
-    start_time = time.time()
-    
-    # 运行交叉验证
-    cv_model = cv.fit(train_data)
-    
-    end_time = time.time()
-    print(f"超参数调优完成，耗时: {(end_time - start_time)/60:.2f} 分钟")
-    
-    # 获取最佳模型
-    best_model = cv_model.bestModel
-    
-    # 提取最佳参数
-    best_rank = best_model._java_obj.parent().getRank()
-    best_reg_param = best_model._java_obj.parent().getRegParam()
-    best_alpha = best_model._java_obj.parent().getAlpha()
-    
-    print(f"最佳rank: {best_rank}")
-    print(f"最佳regParam: {best_reg_param}")
-    print(f"最佳alpha: {best_alpha}")
-    
-    # 在测试集上评估最佳模型
-    test_metrics = evaluate_als_model(best_model, test_data)
-    print("最佳模型在测试集上的表现:")
-    for metric_name, value in test_metrics.items():
-        print(f"{metric_name}: {value:.4f}")
-    
-    return best_model, {
-        'rank': best_rank,
-        'regParam': best_reg_param,
-        'alpha': best_alpha
-    }
-
-# 执行网格搜索
-best_grid_model, best_params = grid_search_cv(train_data, test_data)
-```
-
-## 5.3 随机搜索超参数调优
-
-```python
-# 随机搜索超参数调优
-import random
-
-def random_search(train_data, test_data, n_iter=15):
-    """
-    使用随机搜索进行超参数调优
-    
-    参数:
-        train_data: 训练数据
-        test_data: 测试数据
-        n_iter: 随机搜索迭代次数
-    
-    返回:
-        最佳模型和最佳参数
-    """
-    # 定义超参数搜索空间
-    param_space = {
-        'rank': [10, 15, 20, 30, 50, 75, 100],
-        'regParam': [0.001, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0],
-        'alpha': [0.1, 1.0, 5.0, 10.0, 20.0, 40.0, 80.0]
-    }
-    
-    best_rmse = float('inf')
-    best_model = None
-    best_params = {}
-    results = []
-    
-    print("开始随机搜索超参数调优...")
-    start_time = time.time()
-    
-    for i in range(n_iter):
-        # 随机选择参数
-        rank = random.choice(param_space['rank'])
-        reg_param = random.choice(param_space['regParam'])
-        alpha = random.choice(param_space['alpha'])
-        
-        print(f"\n迭代 {i+1}/{n_iter}:")
-        print(f"尝试参数: rank={rank}, regParam={reg_param}, alpha={alpha}")
-        
-        # 训练模型
-        model = build_als_model(
-            train_data, 
-            implicit=True,
-            rank=rank, 
-            reg_param=reg_param, 
-            alpha=alpha,
-            max_iter=10
-        )
-        
-        # 评估模型
-        metrics = evaluate_als_model(model, test_data)
-        rmse = metrics['RMSE']
-        
-        print(f"RMSE: {rmse:.4f}")
-        
-        # 记录结果
-        results.append({
-            'rank': rank,
-            'regParam': reg_param,
-            'alpha': alpha,
-            'RMSE': rmse
-        })
-        
-        # 更新最佳模型
-        if rmse < best_rmse:
-            best_rmse = rmse
-            best_model = model
-            best_params = {
-                'rank': rank,
-                'regParam': reg_param,
-                'alpha': alpha
-            }
-            print(f"发现新的最佳模型! RMSE: {best_rmse:.4f}")
-    
-    end_time = time.time()
-    print(f"\n随机搜索完成，耗时: {(end_time - start_time)/60:.2f} 分钟")
-    
-    # 将结果转换为DataFrame并排序
-    results_df = pd.DataFrame(results).sort_values('RMSE')
-    print("\n随机搜索结果 (按RMSE排序):")
-    print(results_df.head(10))
-    
-    print("\n最佳参数:")
-    print(f"rank: {best_params['rank']}")
-    print(f"regParam: {best_params['regParam']}")
-    print(f"alpha: {best_params['alpha']}")
-    print(f"RMSE: {best_rmse:.4f}")
-    
-    return best_model, best_params, results_df
-
-# 执行随机搜索
-best_random_model, best_random_params, random_search_results = random_search(train_data, test_data)
-```
-
-## 5.4 贝叶斯优化超参数调优
-
-```python
-# 贝叶斯优化超参数调优
-# 注意：需要安装 hyperopt 库 (pip install hyperopt)
-try:
-    from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
+    from sklearn.metrics.pairwise import cosine_similarity
     import numpy as np
     
-    def objective(params):
-        """贝叶斯优化的目标函数"""
-        rank = int(params['rank'])
-        reg_param = params['reg_param']
-        alpha = params['alpha']
-        
-        print(f"\n尝试参数: rank={rank}, regParam={reg_param}, alpha={alpha}")
-        
-        # 训练模型
-        model = build_als_model(
-            train_data, 
-            implicit=True,
-            rank=rank, 
-            reg_param=reg_param, 
-            alpha=alpha,
-            max_iter=10
-        )
-        
-        # 评估模型
-        metrics = evaluate_als_model(model, test_data)
-        rmse = metrics['RMSE']
-        
-        print(f"RMSE: {rmse:.4f}")
-        
-        return {
-            'loss': rmse,
-            'status': STATUS_OK,
-            'model': model,
-            'params': {
-                'rank': rank,
-                'regParam': reg_param,
-                'alpha': alpha
-            }
-        }
+    # 检查用户是否存在
+    if user_id not in user_features_df['user_id'].values:
+        print(f"用户ID {user_id} 不在数据集中")
+        return []
     
-    def bayesian_optimization(n_iter=20):
-        """使用贝叶斯优化进行超参数调优"""
-        # 定义参数空间
-        space = {
-            'rank': hp.quniform('rank', 5, 100, 5),  # 从5到100，步长为5
-            'reg_param': hp.loguniform('reg_param', np.log(0.001), np.log(1.0)),  # 对数均匀分布
-            'alpha': hp.loguniform('alpha', np.log(0.1), np.log(100.0))  # 对数均匀分布
-        }
-        
-        # 存储所有试验
-        trials = Trials()
-        
-        print("开始贝叶斯优化超参数调优...")
-        start_time = time.time()
-        
-        # 使用TPE算法进行贝叶斯优化
-        best = fmin(
-            fn=objective,
-            space=space,
-            algo=tpe.suggest,
-            trials=trials,
-            max_evals=n_iter
-        )
-        
-        end_time = time.time()
-        print(f"\n贝叶斯优化完成，耗时: {(end_time - start_time)/60:.2f} 分钟")
-        
-        # 获取最佳参数和模型
-        best_trial = min(trials.results, key=lambda x: x['loss'])
-        best_model = best_trial['model']
-        best_params = best_trial['params']
-        best_rmse = best_trial['loss']
-        
-        print("\n贝叶斯优化最佳参数:")
-        print(f"rank: {best_params['rank']}")
-        print(f"regParam: {best_params['regParam']}")
-        print(f"alpha: {best_params['alpha']}")
-        print(f"RMSE: {best_rmse:.4f}")
-        
-        # 准备结果DataFrame
-        results = []
-        for i, trial in enumerate(trials.results):
-            results.append({
-                'iteration': i + 1,
-                'rank': trial['params']['rank'],
-                'regParam': trial['params']['regParam'],
-                'alpha': trial['params']['alpha'],
-                'RMSE': trial['loss']
-            })
-        
-        results_df = pd.DataFrame(results).sort_values('RMSE')
-        print("\n贝叶斯优化结果 (按RMSE排序):")
-        print(results_df.head(10))
-        
-        return best_model, best_params, results_df
+    # 准备用户特征
+    user_features = user_features_df.set_index('user_id')
+    features_columns = ['total_checkins', 'venue_count', 'loyalty_score', 
+                        'tip_count', 'avg_tip_length', 'avg_sentiment']
     
-    # 执行贝叶斯优化
-    best_bayes_model, best_bayes_params, bayes_results = bayesian_optimization()
-
-except ImportError:
-    print("未安装hyperopt库，跳过贝叶斯优化部分")
-    print("可以使用 'pip install hyperopt' 安装该库")
+    # 有些列可能不存在，选择存在的列
+    features_columns = [col for col in features_columns if col in user_features.columns]
+    
+    # 如果没有足够的特征，直接返回
+    if not features_columns:
+        print("没有足够的用户特征进行比较")
+        return []
+    
+    # 过滤掉目标用户ID
+    other_users = user_features.drop(user_id, errors='ignore')
+    
+    # 获取目标用户和其他用户的特征向量
+    target_user_vector = user_features.loc[[user_id]][features_columns].values
+    other_users_vectors = other_users[features_columns].values
+    
+    # 计算余弦相似度
+    similarities = cosine_similarity(target_user_vector, other_users_vectors)[0]
+    
+    # 将相似度与用户ID对应
+    user_similarities = list(zip(other_users.index, similarities))
+    
+    # 按相似度排序
+    user_similarities.sort(key=lambda x: x[1], reverse=True)
+    
+    # 显示最相似的前5名用户
+    print("\n相似用户:")
+    for i, (similar_user, similarity) in enumerate(user_similarities[:5]):
+        user_checkins = interaction_df[interaction_df['user_id'] == similar_user]['checkin_count'].sum()
+        user_venues = interaction_df[interaction_df['user_id'] == similar_user]['venue_id'].nunique()
+        print(f"  {i+1}. 用户ID: {similar_user}, 相似度: {similarity:.4f}, 签到: {user_checkins}, 餐厅数: {user_venues}")
+    
+    # 获取目标用户已访问的餐厅
+    user_visited_venues = set(interaction_df[interaction_df['user_id'] == user_id]['venue_id'])
+    
+    print(f"用户已访问 {len(user_visited_venues)} 个餐厅")
+    
+    # 从相似用户中获取推荐
+    venue_scores = {}
+    for similar_user, similarity in user_similarities[:20]:  # 取前20个相似用户
+        # 获取相似用户访问过的餐厅
+        similar_user_venues = interaction_df[interaction_df['user_id'] == similar_user]
+        
+        for _, row in similar_user_venues.iterrows():
+            venue_id = row['venue_id']
+            
+            # 过滤掉目标用户已访问过的餐厅
+            if venue_id in user_visited_venues:
+                continue
+            
+            # 使用签到次数和情感评分加权
+            weight = row['checkin_count'] * (row['avg_sentiment'] + 1) if not np.isnan(row['avg_sentiment']) else row['checkin_count']
+            score = similarity * weight
+            
+            # 累加分数
+            if venue_id in venue_scores:
+                venue_scores[venue_id] += score
+            else:
+                venue_scores[venue_id] = score
+    
+    # 转换为列表并排序
+    recommendations = [(venue_id, score) for venue_id, score in venue_scores.items()]
+    recommendations.sort(key=lambda x: x[1], reverse=True)
+    
+    print(f"找到 {len(recommendations)} 条推荐")
+    
+    return recommendations[:N]
 ```
 
-## 5.5 调优结果比较与可视化
+## 然后，添加`get_content_based_recommendations`函数
+
+这个函数应该添加在"4.4 基于用户和餐厅特征的内容推荐"部分，替换或添加到`get_enhanced_content_recommendations`函数之后：
 
 ```python
-# 比较不同调优方法的结果
-def compare_tuning_methods(grid_params, random_params, bayes_params=None):
-    """比较不同调优方法的结果"""
-    # 创建比较表
-    methods = ['网格搜索', '随机搜索']
-    params = [grid_params, random_params]
+def get_content_based_recommendations(user_id, user_features_df, venue_features_df, interaction_df, N=10):
+    """
+    基于用户和餐厅特征的内容推荐
     
-    if bayes_params:
-        methods.append('贝叶斯优化')
-        params.append(bayes_params)
+    参数:
+    - user_id: 用户ID
+    - user_features_df: 用户特征DataFrame
+    - venue_features_df: 餐厅特征DataFrame
+    - interaction_df: 交互特征DataFrame
+    - N: 推荐数量
+    """
+    from sklearn.metrics.pairwise import cosine_similarity
     
-    # 使用最佳参数训练模型并评估
-    results = []
-    for method, param in zip(methods, params):
-        # 训练模型
-        model = build_als_model(
-            train_data, 
-            implicit=True,
-            rank=param['rank'], 
-            reg_param=param['regParam'], 
-            alpha=param['alpha'],
-            max_iter=15  # 使用更多迭代次数进行最终训练
-        )
-        
-        # 评估模型
-        metrics = evaluate_als_model(model, test_data)
-        
-        # 记录结果
-        results.append({
-            '调优方法': method,
-            'rank': param['rank'],
-            'regParam': param['regParam'],
-            'alpha': param['alpha'],
-            'RMSE': metrics['RMSE'],
-            'MAE': metrics['MAE']
-        })
+    # 检查用户是否存在
+    if user_id not in user_features_df['user_id'].values:
+        print(f"用户ID {user_id} 不在数据集中")
+        return []
     
-    # 创建比较DataFrame
-    comparison_df = pd.DataFrame(results)
+    # 获取用户访问过的餐厅
+    user_venues = interaction_df[interaction_df['user_id'] == user_id]['venue_id'].unique()
     
-    # 可视化比较结果
-    plt.figure(figsize=(12, 8))
+    # 检查用户是否有访问记录
+    if len(user_venues) == 0:
+        print(f"用户 {user_id} 没有访问记录，无法基于内容推荐")
+        return []
     
-    # RMSE比较
-    plt.subplot(2, 1, 1)
-    sns.barplot(x='调优方法', y='RMSE', data=comparison_df)
-    plt.title('不同调优方法的RMSE比较', fontsize=14)
-    plt.ylabel('RMSE (越低越好)', fontsize=12)
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    print(f"用户访问过 {len(user_venues)} 个餐厅，其中 {len(set(user_venues) & set(venue_features_df['venue_id']))} 个有特征信息")
     
-    # MAE比较
-    plt.subplot(2, 1, 2)
-    sns.barplot(x='调优方法', y='MAE', data=comparison_df)
-    plt.title('不同调优方法的MAE比较', fontsize=14)
-    plt.ylabel('MAE (越低越好)', fontsize=12)
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    # 获取用户访问过的餐厅特征
+    visited_venues_features = venue_features_df[venue_features_df['venue_id'].isin(user_venues)]
     
-    plt.tight_layout()
-    plt.show()
+    # 如果没有足够的特征信息，返回空列表
+    if len(visited_venues_features) == 0:
+        print("没有足够的特征信息进行内容推荐")
+        return []
     
-    return comparison_df
-
-# 比较不同调优方法
-try:
-    comparison_results = compare_tuning_methods(
-        best_params, 
-        best_random_params, 
-        best_bayes_params if 'best_bayes_params' in locals() else None
-    )
-    print("\n调优方法比较结果:")
-    print(comparison_results)
-except:
-    print("无法比较所有调优方法，可能是因为某些方法未执行")
+    # 计算用户偏好的特征向量（取平均）
+    tag_columns = [col for col in venue_features_df.columns if col.startswith('tag_')]
+    numeric_columns = ['total_checkins', 'unique_visitors', 'attraction_score', 'tip_count', 'avg_sentiment']
+    
+    # 标准化数值特征
+    from sklearn.preprocessing import MinMaxScaler
+    scaler = MinMaxScaler()
+    venue_features_df_normalized = venue_features_df.copy()
+    venue_features_df_normalized[numeric_columns] = scaler.fit_transform(venue_features_df[numeric_columns])
+    
+    # 计算用户历史餐厅的平均特征
+    user_preference_vector = visited_venues_features[tag_columns + numeric_columns].mean().values.reshape(1, -1)
+    
+    # 计算所有餐厅与用户偏好的相似度
+    all_venue_features = venue_features_df_normalized[tag_columns + numeric_columns].values
+    similarities = cosine_similarity(user_preference_vector, all_venue_features)[0]
+    
+    # 创建餐厅ID和相似度的映射
+    venue_similarities = list(zip(venue_features_df['venue_id'], similarities))
+    
+    # 过滤掉用户已访问过的餐厅
+    venue_similarities = [(v_id, sim) for v_id, sim in venue_similarities if v_id not in user_venues]
+    
+    # 按相似度排序并选择前N个
+    venue_similarities.sort(key=lambda x: x[1], reverse=True)
+    
+    return venue_similarities[:N]
 ```
 
-## 5.6 超参数敏感性分析
+## 接着，添加`diversify_recommendations`函数
+
+这个函数应该添加在"5.1 混合推荐模型构建"部分，在`mixrec_hybrid_recommendations_enhanced`函数之后：
 
 ```python
-# 超参数敏感性分析
-def parameter_sensitivity_analysis():
-    """分析模型对不同超参数的敏感性"""
-    # 1. rank参数敏感性分析
-    ranks = [5, 10, 20, 50, 100]
-    rank_results = []
+def diversify_recommendations(recommendations, venue_features_df, N=10):
+    """
+    增加推荐列表的多样性
     
-    # 固定其他参数
-    reg_param = best_random_params['regParam']
-    alpha = best_random_params['alpha']
-    
-    print("\n分析rank参数敏感性...")
-    for rank in ranks:
-        model = build_als_model(
-            train_data, 
-            implicit=True,
-            rank=rank, 
-            reg_param=reg_param, 
-            alpha=alpha,
-            max_iter=10
-        )
-        metrics = evaluate_als_model(model, test_data)
-        rank_results.append({
-            'rank': rank,
-            'RMSE': metrics['RMSE']
-        })
-        print(f"rank={rank}, RMSE={metrics['RMSE']:.4f}")
-    
-    # 2. regParam参数敏感性分析
-    reg_params = [0.001, 0.01, 0.1, 0.5, 1.0]
-    reg_param_results = []
-    
-    # 固定其他参数
-    rank = best_random_params['rank']
-    
-    print("\n分析regParam参数敏感性...")
-    for reg_param in reg_params:
-        model = build_als_model(
-            train_data, 
-            implicit=True,
-            rank=rank, 
-            reg_param=reg_param, 
-            alpha=alpha,
-            max_iter=10
-        )
-        metrics = evaluate_als_model(model, test_data)
-        reg_param_results.append({
-            'regParam': reg_param,
-            'RMSE': metrics['RMSE']
-        })
-        print(f"regParam={reg_param}, RMSE={metrics['RMSE']:.4f}")
-    
-    # 3. alpha参数敏感性分析
-    alphas = [0.1, 1.0, 5.0, 10.0, 40.0]
-    alpha_results = []
-    
-    # 固定其他参数
-    reg_param = best_random_params['regParam']
-    
-    print("\n分析alpha参数敏感性...")
-    for alpha in alphas:
-        model = build_als_model(
-            train_data, 
-            implicit=True,
-            rank=rank, 
-            reg_param=reg_param, 
-            alpha=alpha,
-            max_iter=10
-        )
-        metrics = evaluate_als_model(model, test_data)
-        alpha_results.append({
-            'alpha': alpha,
-            'RMSE': metrics['RMSE']
-        })
-        print(f"alpha={alpha}, RMSE={metrics['RMSE']:.4f}")
-    
-    # 可视化参数敏感性
-    plt.figure(figsize=(15, 5))
-    
-    # rank敏感性
-    plt.subplot(1, 3, 1)
-    sns.lineplot(x='rank', y='RMSE', data=pd.DataFrame(rank_results), marker='o')
-    plt.title('rank参数敏感性分析', fontsize=14)
-    plt.xlabel('rank值')
-    plt.ylabel('RMSE (越低越好)')
-    plt.grid(linestyle='--', alpha=0.7)
-    
-    # regParam敏感性
-    plt.subplot(1, 3, 2)
-    sns.lineplot(x='regParam', y='RMSE', data=pd.DataFrame(reg_param_results), marker='o')
-    plt.title('regParam参数敏感性分析', fontsize=14)
-    plt.xlabel('regParam值')
-    plt.ylabel('RMSE (越低越好)')
-    plt.grid(linestyle='--', alpha=0.7)
-    plt.xscale('log')  # 对数刻度
-    
-    # alpha敏感性
-    plt.subplot(1, 3, 3)
-    sns.lineplot(x='alpha', y='RMSE', data=pd.DataFrame(alpha_results), marker='o')
-    plt.title('alpha参数敏感性分析', fontsize=14)
-    plt.xlabel('alpha值')
-    plt.ylabel('RMSE (越低越好)')
-    plt.grid(linestyle='--', alpha=0.7)
-    plt.xscale('log')  # 对数刻度
-    
-    plt.tight_layout()
-    plt.show()
-    
-    return {
-        'rank_sensitivity': pd.DataFrame(rank_results),
-        'regParam_sensitivity': pd.DataFrame(reg_param_results),
-        'alpha_sensitivity': pd.DataFrame(alpha_results)
-    }
-
-# 执行超参数敏感性分析
-sensitivity_results = parameter_sensitivity_analysis()
+    参数:
+    - recommendations: 初始推荐列表，包含(venue_id, score, source, original_scores)
+    - venue_features_df: 餐厅特征DataFrame
+    - N: 最终推荐数量
+    """
+    try:
+        # 确保有足够的推荐
+        if len(recommendations) <= N:
+            return recommendations
+        
+        # 获取餐厅标签
+        tag_columns = [col for col in venue_features_df.columns if col.startswith('tag_')]
+        venue_tags = {}
+        
+        for venue_id in [r[0] for r in recommendations]:
+            venue_data = venue_features_df[venue_features_df['venue_id'] == venue_id]
+            if not venue_data.empty:
+                tags = []
+                for tag in tag_columns:
+                    if venue_data[tag].values[0] == 1:
+                        tags.append(tag[4:])  # 去掉'tag_'前缀
+                venue_tags[venue_id] = set(tags)
+            else:
+                venue_tags[venue_id] = set()
+        
+        # 多样性推荐算法
+        final_diverse = []
+        
+        # 首先添加得分最高的推荐
+        final_diverse.append(recommendations[0])
+        selected_tags = venue_tags.get(recommendations[0][0], set())
+        
+        remaining = recommendations[1:]
+        
+        # 继续选择最多样的推荐
+        while len(final_diverse) < N and remaining:
+            # 为每个候选计算多样性分数
+            diversity_scores = []
+            
+            for i, (venue_id, score, source, original_scores) in enumerate(remaining):
+                # 计算与已选择项的标签交集
+                venue_tag_set = venue_tags.get(venue_id, set())
+                
+                # 如果没有标签，给予较低的多样性分数
+                if not venue_tag_set:
+                    overlap_ratio = 0.5  # 中等多样性
+                else:
+                    # 计算标签重叠比例
+                    overlap = len(selected_tags & venue_tag_set)
+                    total = len(selected_tags | venue_tag_set) if len(selected_tags | venue_tag_set) > 0 else 1
+                    overlap_ratio = 1 - (overlap / total)  # 多样性分数 (1 = 完全不同，0 = 完全相同)
+                
+                diversity_scores.append((i, overlap_ratio))
+            
+            # 选择多样性最高的选项
+            diversity_scores.sort(key=lambda x: x[1], reverse=True)
+            best_idx = diversity_scores[0][0]
+            
+            # 添加差异最大的推荐
+            best_rec = remaining.pop(best_idx)
+            final_diverse.append(best_rec)
+            # 更新已选标签集合
+            if best_rec[0] in venue_tags:
+                selected_tags.update(venue_tags[best_rec[0]])
+        
+        # 如果多样化后的推荐不足，从原列表补充
+        while len(final_diverse) < N and remaining:
+            final_diverse.append(remaining.pop(0))
+            
+        return final_diverse
+    except Exception as e:
+        print(f"多样性处理异常: {e}")
+        # 出错时返回原始推荐
+        return recommendations[:N]
 ```
 
-## 5.7 最终模型训练与保存
+## 最后，完善`get_improved_als_recommendations`函数
+
+如果您的代码中已经有这个函数，只是需要补充完整，请在"4.1 协同过滤模型"部分找到这个函数并确保其实现与我前面提供的一致。如果没有，您应该添加在这个部分：
 
 ```python
-# 使用最佳参数训练最终模型
-def train_final_model(best_params):
-    """使用最佳参数训练最终模型"""
-    print("\n使用最佳参数训练最终模型...")
-    final_model = build_als_model(
-        train_data = spark.createDataFrame(interaction_features_pd).select(
-            col('user_id').alias('user'),
-            col('venue_id').alias('item'),
-            col('checkin_count').alias('rating')
-        ).na.fill(1),  # 使用所有数据
-        implicit=True,
-        rank=best_params['rank'],
-        reg_param=best_params['regParam'],
-        alpha=best_params['alpha'],
-        max_iter=20  # 增加迭代次数以确保收敛
-    )
+def get_improved_als_recommendations(model, user_id, user_map, venue_map, venue_index_to_id, 
+                                    interaction_matrix, N=10, diversity_factor=0.2):
+    """
+    获取改进的ALS推荐
     
-    print("最终模型训练完成!")
-    return final_model
-
-# 训练最终模型
-final_model = train_final_model(best_random_params)  # 使用随机搜索的最佳参数
-
-# 保存最终模型
-save_als_model(final_model, "models/final_als_model")
-
-# 生成一些最终模型的推荐示例
-print("\n使用最终模型生成推荐样例:")
-all_users = interaction_features_pd['user_id'].unique()
-sample_users = np.random.choice(all_users, min(5, len(all_users)), replace=False)
-
-for user_id in sample_users:
-    recommendations = recommend_for_user(final_model, user_id, 10)
-    user_recs = recommendations.toPandas()
+    参数:
+    - diversity_factor: 多样性调节因子，0-1之间，值越大推荐多样性越高
+    """
+    if user_id not in user_map:
+        print(f"用户ID {user_id} 不在训练数据中")
+        return []
     
-    if not user_recs.empty:
-        recs = user_recs.iloc[0]['recommendations']
-        print(f"\n用户 {user_id} 的推荐餐厅:")
-        for i, rec in enumerate(recs, 1):
-            print(f"{i}. 餐厅ID: {rec.item}, 预测得分: {rec.rating:.4f}")
-
-# 关闭Spark会话
-spark.stop()
-print("\nALS模型超参数调优完成，并保存了最终模型。")
+    user_idx = user_map[user_id]
+    
+    # 获取用户向量
+    user_vector = model.user_factors[user_idx]
+    
+    # 计算所有物品的预测分数
+    item_scores = model.item_factors.dot(user_vector)
+    
+    # 获取用户已交互的物品索引
+    interacted_items = interaction_matrix[user_idx].indices
+    
+    # 过滤已交互的物品，将其分数设为负无穷
+    item_scores[interacted_items] = -np.inf
+    
+    # 选择前N*2个物品，用于增加多样性选择空间
+    top_items_indices = np.argsort(-item_scores)[:int(N*2)]
+    candidate_items = [(venue_index_to_id[idx], item_scores[idx]) for idx in top_items_indices]
+    
+    # 应用多样性增强算法
+    if diversity_factor > 0:
+        selected_items = []
+        remaining_candidates = candidate_items.copy()
+        
+        # 先选择得分最高的物品
+        selected_items.append(remaining_candidates.pop(0))
+        
+        # 然后交替选择高分和多样性物品
+        while len(selected_items) < N and remaining_candidates:
+            # 计算剩余候选项与已选项的相似度
+            candidate_scores = []
+            for cand_id, cand_score in remaining_candidates:
+                # 多样性得分 - 与已选项的最大相似度的负值
+                try:
+                    diversity_score = -max([model.item_factors[venue_map[v_id]].dot(model.item_factors[venue_map[cand_id]])
+                                           for v_id, _ in selected_items]) if selected_items else 0
+                except KeyError:
+                    # 处理venue_map中可能缺失的ID
+                    diversity_score = 0
+                
+                # 组合得分 = 原始得分 * (1-diversity_factor) + 多样性得分 * diversity_factor
+                combined_score = cand_score * (1-diversity_factor) + diversity_score * diversity_factor
+                candidate_scores.append((cand_id, cand_score, combined_score))
+            
+            # 选择组合得分最高的项
+            candidate_scores.sort(key=lambda x: x[2], reverse=True)
+            best_candidate = candidate_scores[0]
+            selected_items.append((best_candidate[0], best_candidate[1]))
+            
+            # 从候选列表中移除已选项
+            remaining_candidates = [item for item in remaining_candidates if item[0] != best_candidate[0]]
+        
+        return selected_items[:N]
+    else:
+        # 不应用多样性时，直接返回得分最高的N个物品
+        return candidate_items[:N]
 ```
 
-这套完整的代码实现了ALS推荐模型的构建和系统化超参数调优，包括网格搜索、随机搜索和贝叶斯优化三种调优策略，并进行了详细的敏感性分析和结果可视化。通过这些步骤，我们能够找到最适合餐厅推荐数据的模型配置，并提供高质量的个性化推荐结果。
+这样，您就完成了所有必要函数的添加，可以支持`mixrec_hybrid_recommendations_enhanced`函数的正常运行。请确保这些函数都添加在适当的位置，并且导入了所有必要的库。

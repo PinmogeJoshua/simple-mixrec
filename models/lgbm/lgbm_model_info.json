@@ -1,15 +1,26 @@
 {
-    "sample_size": 100000,
-    "total_data_size": 440054,
-    "train_time": 1.8264915943145752,
+    "features_used": [
+        "Avg_Category_Purchase",
+        "Avg_User_Purchase",
+        "Product_Spending",
+        "Product_Category",
+        "Purchase_Frequency_Ratio",
+        "Age_City",
+        "Age_target_var",
+        "Purchase_Count_Sq",
+        "Occupation",
+        "Age_target_mean"
+    ],
+    "feature_count": 10,
+    "train_time": 0.8868899345397949,
     "parameters": {
-        "n_estimators": 600,
-        "learning_rate": 0.01,
-        "max_depth": 7,
-        "num_leaves": 31,
-        "subsample": 1.0,
-        "colsample_bytree": 0.8,
-        "random_state": 42
+        "subsample": 0.8,
+        "num_leaves": 63,
+        "n_estimators": 200,
+        "min_child_samples": 20,
+        "max_depth": 9,
+        "learning_rate": 0.2,
+        "colsample_bytree": 0.9
     },
-    "training_date": "2025-04-12 09:42:15"
+    "training_date": "2025-04-12 12:54:28"
 }

@@ -1,0 +1,15 @@
+{
+    "sample_size": 100000,
+    "total_data_size": 440054,
+    "train_time": 1.8264915943145752,
+    "parameters": {
+        "n_estimators": 600,
+        "learning_rate": 0.01,
+        "max_depth": 7,
+        "num_leaves": 31,
+        "subsample": 1.0,
+        "colsample_bytree": 0.8,
+        "random_state": 42
+    },
+    "training_date": "2025-04-12 08:46:45"
+}

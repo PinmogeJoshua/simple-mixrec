@@ -1,0 +1,14 @@
+{
+    "sample_size": 100000,
+    "total_data_size": 440054,
+    "train_time": 181.9344401359558,
+    "base_models": [
+        "lgbm",
+        "gbm",
+        "xgb",
+        "ridge"
+    ],
+    "final_estimator": "Ridge",
+    "cross_validation": 5,
+    "training_date": "2025-04-12 10:12:47"
+}

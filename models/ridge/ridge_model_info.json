@@ -1,0 +1,14 @@
+{
+    "sample_size": 100000,
+    "total_data_size": 440054,
+    "train_time": 0.9170742034912109,
+    "parameters": {
+        "alpha": 0.1,
+        "solver": "sag",
+        "fit_intercept": true,
+        "max_iter": 1000,
+        "tol": 0.0001,
+        "random_state": 42
+    },
+    "training_date": "2025-04-12 10:01:42"
+}
